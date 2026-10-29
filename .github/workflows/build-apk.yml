@@ -1,0 +1,170 @@
+# Build APK BOTLAUNCH di GitHub (gratis, tanpa komputer sendiri) untuk proyek web Vite + Capacitor Android.
+#
+# CARA PAKAI
+# 1. Taruh file ini di repo proyek app kamu: .github/workflows/build-apk.yml
+# 2. Tab Actions -> "build-apk" -> Run workflow (atau otomatis tiap push ke main/master).
+# 3. Selesai (±6-10 menit): buka run-nya -> bagian Artifacts -> unduh "botlaunch-apk" (zip berisi .apk).
+#
+# TANPA SECRET -> menghasilkan APK *debug* (langsung bisa dipasang di HP; bertanda tangan kunci debug).
+# DENGAN SECRET -> menghasilkan APK *release* bertanda tangan kunci kamu sendiri. Isi di
+# Settings -> Secrets and variables -> Actions -> Secrets:
+# ANDROID_KEYSTORE_BASE64 isi file .jks yang di-base64 (Linux/Mac: base64 -w0 botlaunch.jks)
+# ANDROID_KEYSTORE_PASSWORD
+# ANDROID_KEY_ALIAS
+# ANDROID_KEY_PASSWORD (opsional; kalau kosong dipakai ANDROID_KEYSTORE_PASSWORD)
+# Membuat keystore (sekali saja, SIMPAN file & passwordnya; kalau hilang kamu tidak bisa update app):
+# keytool -genkey -v -keystore botlaunch.jks -alias botlaunch -keyalg RSA -keysize 2048 -validity 10000
+#
+# OPSIONAL: variable repo APP_DIR (Settings -> Secrets and variables -> Actions -> Variables)
+# kalau folder proyek web tidak terdeteksi otomatis (mis. "app").
+name: build-apk
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'server/**'
+      - 'tests/**'
+      - '.github/workflows/keepalive.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cari folder proyek (yang punya capacitor.config.*) dan pilih versi Java sesuai versi Capacitor:
+      # Capacitor 7+ butuh Java 21, Capacitor 6 ke bawah Java 17.
+      - name: Deteksi proyek
+        id: proj
+        env:
+          APP_DIR_VAR: ${{ vars.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_DIR_VAR:-}" ]; then
+            dir="${APP_DIR_VAR%/}"
+          else
+            cfg="$(find . -maxdepth 3 -name 'capacitor.config.*' -not -path '*/node_modules/*' | sort | head -n1)"
+            if [ -z "$cfg" ]; then
+              echo "::error::capacitor.config.* tidak ditemukan. Isi variable repo APP_DIR dengan folder proyek web."
+              exit 1
+            fi
+            dir="$(dirname "$cfg")"
+          fi
+          if [ ! -f "$dir/package.json" ]; then
+            echo "::error::$dir/package.json tidak ada."
+            exit 1
+          fi
+          java="$(node -e ' const p = require(process.argv[1]); const v = (p.dependencies && (p.dependencies["@capacitor/android"] || p.dependencies["@capacitor/core"])) || (p.devDependencies && (p.devDependencies["@capacitor/android"] || p.devDependencies["@capacitor/core"])) || ""; const m = /(\d+)/.exec(v); console.log(m && Number(m[1]) >= 7 ? 21 : 17); ' "$PWD/$dir/package.json")"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "java=$java" >> "$GITHUB_OUTPUT"
+          echo "Proyek: $dir | Java: $java"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.proj.outputs.java }}
+
+      - name: Pasang phone-sync (cadangan di HP) di index.html
+        env:
+          DIR: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$DIR/public/phone-sync.js" ]; then
+            echo "::warning::$DIR/public/phone-sync.js tidak ada, APK dibuild TANPA cadangan di HP. Salin phone-sync.js ke $DIR/public/ lalu jalankan ulang."
+            exit 0
+          fi
+          if grep -q 'phone-sync.js' "$DIR/index.html"; then
+            echo "index.html sudah memuat phone-sync.js"
+          else
+            sed -i 's#</head># <script defer src="/phone-sync.js"></script>\n </head>#' "$DIR/index.html"
+            grep -q 'phone-sync.js' "$DIR/index.html" || { echo "::error::gagal menambah <script> ke $DIR/index.html"; exit 1; }
+            echo "Menambah <script defer src=\"/phone-sync.js\"> ke $DIR/index.html"
+          fi
+
+      - name: Install dependency + build web
+        env:
+          DIR: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cd "$DIR"
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          test -f dist/phone-sync.js && echo "phone-sync.js ikut ke dist/" || echo "(phone-sync.js tidak ada di dist/)"
+
+      - name: Capacitor sync Android
+        env:
+          DIR: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cd "$DIR"
+          if [ ! -d android ]; then
+            echo "Folder android/ belum ada di repo -> npx cap add android"
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: Terima lisensi Android SDK
+        run: |
+          yes | "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Build APK
+        id: build
+        env:
+          DIR: ${{ steps.proj.outputs.dir }}
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "$DIR/android"
+          chmod +x gradlew
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          if [ -n "${KS_B64:-}" ] && [ -n "${KS_PASS:-}" ] && [ -n "${KS_ALIAS:-}" ]; then
+            echo "Secret keystore ada -> build RELEASE bertanda tangan"
+            ./gradlew --no-daemon assembleRelease
+            unsigned="$(find app/build/outputs/apk/release -name '*.apk' | head -n1)"
+            [ -n "$unsigned" ] || { echo "::error::APK release tidak ditemukan"; exit 1; }
+            ks="$RUNNER_TEMP/release.jks"
+            echo "$KS_B64" | base64 -d > "$ks"
+            bt="$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n1)"
+            "$bt/zipalign" -p -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+            KEY_PASS="${KEY_PASS:-$KS_PASS}" KS_PASS="$KS_PASS" \
+              "$bt/apksigner" sign --ks "$ks" --ks-key-alias "$KS_ALIAS" \
+                --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+                --out "$GITHUB_WORKSPACE/out/botlaunch-release.apk" "$RUNNER_TEMP/aligned.apk"
+            "$bt/apksigner" verify --print-certs "$GITHUB_WORKSPACE/out/botlaunch-release.apk" | head -n 3
+            rm -f "$ks"
+          else
+            if [ -n "${KS_B64:-}${KS_PASS:-}${KS_ALIAS:-}" ]; then
+              echo "::warning::Secret keystore TIDAK LENGKAP (butuh ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS). Build jatuh ke DEBUG."
+            fi
+            echo "Tidak ada secret keystore lengkap -> build DEBUG (tetap bisa dipasang di HP)"
+            ./gradlew --no-daemon assembleDebug
+            apk="$(find app/build/outputs/apk/debug -name '*.apk' | head -n1)"
+            [ -n "$apk" ] || { echo "::error::APK debug tidak ditemukan"; exit 1; }
+            cp "$apk" "$GITHUB_WORKSPACE/out/botlaunch-debug.apk"
+          fi
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botlaunch-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
